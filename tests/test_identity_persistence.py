@@ -144,3 +144,45 @@ def test_authenticated_grant_rejects_non_admin_and_forged_context(tmp_path):
     finally:
         policy.close()
         registry.close()
+
+
+def test_authenticated_grant_rechecks_admin_capability_inside_transaction(tmp_path, monkeypatch):
+    import base64, hashlib, hmac, json, time
+    from collective_computation.authentication import HMACTokenAuthenticator, authorize_actor
+    import collective_computation.identity_persistence as persistence
+
+    secret = b"test-only-secret-material-at-least-32-bytes"
+    now = int(time.time())
+    claims = {"sub": "admin-1", "iss": "trusted-control-plane", "aud": "collective-computation",
+              "iat": now - 5, "exp": now + 300, "jti": "admin-token"}
+    payload = base64.urlsafe_b64encode(json.dumps(claims, separators=(",", ":")).encode()).rstrip(b"=").decode()
+    signed = f"cc1.{payload}".encode()
+    sig = base64.urlsafe_b64encode(hmac.new(secret, signed, hashlib.sha256).digest()).rstrip(b"=").decode()
+    token = f"cc1.{payload}.{sig}"
+    auth = HMACTokenAuthenticator(secret, expected_issuer="trusted-control-plane",
+        expected_audience="collective-computation")
+
+    db = tmp_path / "audit-race.sqlite3"
+    registry = SQLiteIdentityRegistry(db)
+    policy = SQLiteAuthorizationPolicy(db)
+    try:
+        registry.register(Identity("admin-1", "Admin", SubjectType.HUMAN))
+        registry.register(Identity("human-2", "Member", SubjectType.HUMAN))
+        policy.grant("admin-1", "*", Permission.AUTHORIZATION_MANAGE)
+        actor = auth.authenticate("Bearer " + token)
+
+        # Simulate revocation immediately after the initial authorization check.
+        def authorize_then_revoke(*args, **kwargs):
+            result = authorize_actor(*args, **kwargs)
+            policy.revoke("admin-1", "*", Permission.AUTHORIZATION_MANAGE)
+            return result
+
+        monkeypatch.setattr(persistence, "authorize_actor", authorize_then_revoke)
+        with pytest.raises(AuthorizationError, match="authorization management permission required"):
+            policy.grant_as(actor, registry, "human-2", "mem-1", Permission.MEMORY_READ)
+        assert not policy.is_allowed("human-2", "mem-1", Permission.MEMORY_READ)
+        assert not any(e["event_type"] == "grant_created" and e["resource_id"] == "mem-1"
+                       for e in policy.audit_events())
+    finally:
+        policy.close()
+        registry.close()
