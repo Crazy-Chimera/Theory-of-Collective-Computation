@@ -1,5 +1,4 @@
 """Minimal HTTP health endpoint for container and Render diagnostics."""
-
 from __future__ import annotations
 
 import json
@@ -12,11 +11,10 @@ class HealthHandler(BaseHTTPRequestHandler):
         if self.path not in ("/", "/health"):
             self.send_error(404, "not found")
             return
-
         payload = {
             "service": "theory-of-collective-computation",
             "status": "ok",
-            "version": "0.1.0",
+            "version": "0.3.0",
         }
         body = json.dumps(payload).encode("utf-8")
         self.send_response(200)
@@ -26,15 +24,13 @@ class HealthHandler(BaseHTTPRequestHandler):
         if include_body:
             self.wfile.write(body)
 
-    def do_GET(self) -> None:  # noqa: N802 - required by BaseHTTPRequestHandler
+    def do_GET(self) -> None:  # noqa: N802
         self._respond(include_body=True)
 
-    def do_HEAD(self) -> None:  # noqa: N802 - required by BaseHTTPRequestHandler
-        # Render and other health probes commonly issue HEAD requests.
+    def do_HEAD(self) -> None:  # noqa: N802
         self._respond(include_body=False)
 
     def log_message(self, format: str, *args: object) -> None:
-        # Keep request logs concise; Render captures stdout/stderr.
         print("%s - %s" % (self.address_string(), format % args))
 
 
