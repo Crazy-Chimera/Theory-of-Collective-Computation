@@ -104,7 +104,7 @@ def test_authenticated_grant_and_revoke_record_actor_id(tmp_path):
         }))
         policy.grant_as(actor, registry, "human-2", "mem-1", Permission.MEMORY_READ)
         policy.revoke_as(actor, registry, "human-2", "mem-1", Permission.MEMORY_READ)
-        events = [e for e in policy.audit_events() if e["event_type"] in {"grant_created", "grant_revoked"}]
+        events = [e for e in policy.audit_events() if e["resource_id"] == "mem-1" and e["event_type"] in {"grant_created", "grant_revoked"}]
         assert [e["event_type"] for e in events] == ["grant_created", "grant_revoked"]
         assert [e["actor_id"] for e in events] == ["admin-1", "admin-1"]
     finally:
