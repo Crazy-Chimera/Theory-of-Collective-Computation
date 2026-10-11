@@ -1,9 +1,11 @@
 """SQLite-backed identity registry and deny-by-default authorization policy."""
 from __future__ import annotations
 import sqlite3
+import time
 from pathlib import Path
 from threading import RLock
 from .identity import AuthorizationError, AuthorizationPolicy, Identity, IdentityError, IdentityRegistry, Permission, SubjectType
+from .authentication import AuthenticatedActorContext, AuthenticationError, authorize_actor
 
 def _connect(path):
     path = str(path)
@@ -13,10 +15,13 @@ def _connect(path):
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA foreign_keys=ON")
     db.execute("PRAGMA busy_timeout=5000")
+    # Serialize initial schema creation and all upgrades. Re-read the schema version
+    # only after BEGIN IMMEDIATE so concurrent processes cannot race the ALTER TABLE.
     with db:
+        db.execute("BEGIN IMMEDIATE")
         db.execute("CREATE TABLE IF NOT EXISTS identity_migrations(version INTEGER PRIMARY KEY, applied_at TEXT DEFAULT CURRENT_TIMESTAMP)")
         version = db.execute("SELECT MAX(version) v FROM identity_migrations").fetchone()["v"] or 0
-        if version > 1:
+        if version > 2:
             raise RuntimeError("database schema newer than this implementation")
         if version == 0:
             db.execute("""CREATE TABLE identities(identity_id TEXT PRIMARY KEY, display_name TEXT NOT NULL,
@@ -37,6 +42,12 @@ def _connect(path):
             db.execute("""CREATE TRIGGER audit_no_delete BEFORE DELETE ON identity_audit BEGIN
                 SELECT RAISE(ABORT,'audit history is append-only'); END""")
             db.execute("INSERT INTO identity_migrations(version) VALUES(1)")
+            version = 1
+        if version < 2:
+            columns = {row["name"] for row in db.execute("PRAGMA table_info(identity_audit)")}
+            if "actor_id" not in columns:
+                db.execute("ALTER TABLE identity_audit ADD COLUMN actor_id TEXT")
+            db.execute("INSERT OR IGNORE INTO identity_migrations(version) VALUES(2)")
     return db
 
 class SQLiteIdentityRegistry(IdentityRegistry):
@@ -122,6 +133,88 @@ class SQLiteAuthorizationPolicy(AuthorizationPolicy):
         with self._lock:
             return self._db.execute("SELECT 1 FROM grants WHERE subject_id=? AND resource_id=? AND permission=?",
                 (subject_id, resource_id, permission.value)).fetchone() is not None
+
+    def grant_as(
+        self, actor: AuthenticatedActorContext, registry: SQLiteIdentityRegistry,
+        subject_id: str, resource_id: str, permission: Permission,
+    ) -> None:
+        """Grant access and attribute the audit event to an authenticated administrator.
+
+        The actor must have authorization:manage on the reserved '*' resource.
+        Legacy grant() remains a trusted local/bootstrap operation and records no actor.
+        """
+        authorize_actor(actor, registry=registry, policy=self,
+            resource_id="*", permission=Permission.AUTHORIZATION_MANAGE)
+        if not isinstance(subject_id, str) or not subject_id.strip() or not isinstance(resource_id, str) or not resource_id.strip():
+            raise AuthorizationError("subject_id and resource_id must not be empty")
+        if not isinstance(permission, Permission):
+            raise AuthorizationError("permission must be a Permission")
+        # Recheck the administrative capability inside the same write transaction
+        # as the grant. This closes the TOCTOU window between the initial check and mutation.
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                if actor.expires_at <= int(time.time()):
+                    raise AuthenticationError("authenticated actor context has expired")
+                if self._db.execute(
+                    "SELECT 1 FROM identities WHERE identity_id=?", (actor.subject_id,)
+                ).fetchone() is None:
+                    raise AuthenticationError("authenticated identity is not registered")
+                if self._db.execute(
+                    "SELECT 1 FROM grants WHERE subject_id=? AND resource_id='*' AND permission=?",
+                    (actor.subject_id, Permission.AUTHORIZATION_MANAGE.value),
+                ).fetchone() is None:
+                    raise AuthorizationError("access denied: authorization management permission required")
+                cur = self._db.execute("INSERT OR IGNORE INTO grants VALUES(?,?,?)",
+                    (subject_id, resource_id, permission.value))
+                if cur.rowcount:
+                    self._db.execute(
+                        "INSERT INTO identity_audit(event_type,subject_id,resource_id,permission,actor_id) VALUES('grant_created',?,?,?,?)",
+                        (subject_id, resource_id, permission.value, actor.subject_id),
+                    )
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
+
+    def revoke_as(
+        self, actor: AuthenticatedActorContext, registry: SQLiteIdentityRegistry,
+        subject_id: str, resource_id: str, permission: Permission,
+    ) -> None:
+        """Revoke access and attribute the audit event to an authenticated administrator."""
+        authorize_actor(actor, registry=registry, policy=self,
+            resource_id="*", permission=Permission.AUTHORIZATION_MANAGE)
+        if not isinstance(subject_id, str) or not subject_id.strip() or not isinstance(resource_id, str) or not resource_id.strip():
+            raise AuthorizationError("subject_id and resource_id must not be empty")
+        if not isinstance(permission, Permission):
+            raise AuthorizationError("permission must be a Permission")
+        # Recheck the administrative capability inside the same write transaction
+        # as the revocation, so the authorization decision cannot go stale mid-operation.
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                if actor.expires_at <= int(time.time()):
+                    raise AuthenticationError("authenticated actor context has expired")
+                if self._db.execute(
+                    "SELECT 1 FROM identities WHERE identity_id=?", (actor.subject_id,)
+                ).fetchone() is None:
+                    raise AuthenticationError("authenticated identity is not registered")
+                if self._db.execute(
+                    "SELECT 1 FROM grants WHERE subject_id=? AND resource_id='*' AND permission=?",
+                    (actor.subject_id, Permission.AUTHORIZATION_MANAGE.value),
+                ).fetchone() is None:
+                    raise AuthorizationError("access denied: authorization management permission required")
+                cur = self._db.execute("DELETE FROM grants WHERE subject_id=? AND resource_id=? AND permission=?",
+                    (subject_id, resource_id, permission.value))
+                if cur.rowcount:
+                    self._db.execute(
+                        "INSERT INTO identity_audit(event_type,subject_id,resource_id,permission,actor_id) VALUES('grant_revoked',?,?,?,?)",
+                        (subject_id, resource_id, permission.value, actor.subject_id),
+                    )
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
 
     def audit_events(self):
         with self._lock:

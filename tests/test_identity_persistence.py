@@ -12,7 +12,7 @@ def test_identity_and_parent_survive_restart(tmp_path):
     r=SQLiteIdentityRegistry(db)
     try:
         assert r.get("human-1")==h and r.get("agent-1")==a
-        assert len(r)==2 and r.schema_version==1
+        assert len(r)==2 and r.schema_version==2
     finally: r.close()
 
 def test_unknown_parent_and_duplicate_are_rejected(tmp_path):
@@ -73,3 +73,147 @@ def test_registry_and_policy_share_database(tmp_path):
         assert p.is_allowed("human-1","mem-1",Permission.MEMORY_WRITE)
         assert any(e["event_type"]=="identity_registered" for e in p.audit_events())
     finally: p.close()
+
+
+def test_authenticated_grant_and_revoke_record_actor_id(tmp_path):
+    import base64, hashlib, hmac, json, time
+    from collective_computation.authentication import HMACTokenAuthenticator
+    secret = b"test-only-secret-material-at-least-32-bytes"
+    now = int(time.time())
+    def make_token(claims):
+        data = {"sub": "admin-1", "iss": "trusted-control-plane", "aud": "collective-computation",
+                "iat": now - 5, "exp": now + 300, "jti": "admin-token"}
+        data.update(claims)
+        payload = base64.urlsafe_b64encode(json.dumps(data, separators=(",", ":")).encode()).rstrip(b"=").decode()
+        signed = f"cc1.{payload}".encode()
+        sig = base64.urlsafe_b64encode(hmac.new(secret, signed, hashlib.sha256).digest()).rstrip(b"=").decode()
+        return f"cc1.{payload}.{sig}"
+    auth = HMACTokenAuthenticator(secret, expected_issuer="trusted-control-plane",
+        expected_audience="collective-computation")
+
+    db = tmp_path / "audit.sqlite3"
+    registry = SQLiteIdentityRegistry(db)
+    policy = SQLiteAuthorizationPolicy(db)
+    try:
+        registry.register(Identity("admin-1", "Admin", SubjectType.HUMAN))
+        registry.register(Identity("human-2", "Member", SubjectType.HUMAN))
+        # Trusted local bootstrap grants the admin-management capability.
+        policy.grant("admin-1", "*", Permission.AUTHORIZATION_MANAGE)
+        actor = auth.authenticate("Bearer " + make_token({
+            "sub": "admin-1", "jti": "admin-token",
+        }))
+        policy.grant_as(actor, registry, "human-2", "mem-1", Permission.MEMORY_READ)
+        policy.revoke_as(actor, registry, "human-2", "mem-1", Permission.MEMORY_READ)
+        events = [e for e in policy.audit_events() if e["resource_id"] == "mem-1" and e["event_type"] in {"grant_created", "grant_revoked"}]
+        assert [e["event_type"] for e in events] == ["grant_created", "grant_revoked"]
+        assert [e["actor_id"] for e in events] == ["admin-1", "admin-1"]
+    finally:
+        policy.close()
+        registry.close()
+
+
+def test_authenticated_grant_rejects_non_admin_and_forged_context(tmp_path):
+    from collective_computation.authentication import AuthenticationError, AuthenticatedActorContext
+    import base64, hashlib, hmac, json, time
+    from collective_computation.authentication import HMACTokenAuthenticator
+    secret = b"test-only-secret-material-at-least-32-bytes"
+    now = int(time.time())
+    def make_token(claims):
+        data = {"sub": "human-1", "iss": "trusted-control-plane", "aud": "collective-computation",
+                "iat": now - 5, "exp": now + 300, "jti": "member-token"}
+        data.update(claims)
+        payload = base64.urlsafe_b64encode(json.dumps(data, separators=(",", ":")).encode()).rstrip(b"=").decode()
+        signed = f"cc1.{payload}".encode()
+        sig = base64.urlsafe_b64encode(hmac.new(secret, signed, hashlib.sha256).digest()).rstrip(b"=").decode()
+        return f"cc1.{payload}.{sig}"
+    auth = HMACTokenAuthenticator(secret, expected_issuer="trusted-control-plane",
+        expected_audience="collective-computation")
+
+    db = tmp_path / "audit.sqlite3"
+    registry = SQLiteIdentityRegistry(db)
+    policy = SQLiteAuthorizationPolicy(db)
+    try:
+        registry.register(Identity("human-1", "Member", SubjectType.HUMAN))
+        actor = auth.authenticate("Bearer " + make_token({"sub": "human-1"}))
+        with pytest.raises(AuthenticationError, match="access denied"):
+            policy.grant_as(actor, registry, "human-1", "mem-1", Permission.MEMORY_READ)
+        forged = AuthenticatedActorContext("human-1", "trusted-control-plane",
+            "collective-computation", 1, 4_000_000_000, "forged")
+        with pytest.raises(AuthenticationError, match="verified actor context"):
+            policy.grant_as(forged, registry, "human-1", "mem-1", Permission.MEMORY_READ)
+    finally:
+        policy.close()
+        registry.close()
+
+
+def test_authenticated_grant_rechecks_admin_capability_inside_transaction(tmp_path, monkeypatch):
+    import base64, hashlib, hmac, json, time
+    from collective_computation.authentication import HMACTokenAuthenticator, authorize_actor
+    import collective_computation.identity_persistence as persistence
+
+    secret = b"test-only-secret-material-at-least-32-bytes"
+    now = int(time.time())
+    claims = {"sub": "admin-1", "iss": "trusted-control-plane", "aud": "collective-computation",
+              "iat": now - 5, "exp": now + 300, "jti": "admin-token"}
+    payload = base64.urlsafe_b64encode(json.dumps(claims, separators=(",", ":")).encode()).rstrip(b"=").decode()
+    signed = f"cc1.{payload}".encode()
+    sig = base64.urlsafe_b64encode(hmac.new(secret, signed, hashlib.sha256).digest()).rstrip(b"=").decode()
+    token = f"cc1.{payload}.{sig}"
+    auth = HMACTokenAuthenticator(secret, expected_issuer="trusted-control-plane",
+        expected_audience="collective-computation")
+
+    db = tmp_path / "audit-race.sqlite3"
+    registry = SQLiteIdentityRegistry(db)
+    policy = SQLiteAuthorizationPolicy(db)
+    try:
+        registry.register(Identity("admin-1", "Admin", SubjectType.HUMAN))
+        registry.register(Identity("human-2", "Member", SubjectType.HUMAN))
+        policy.grant("admin-1", "*", Permission.AUTHORIZATION_MANAGE)
+        actor = auth.authenticate("Bearer " + token)
+
+        # Simulate revocation immediately after the initial authorization check.
+        def authorize_then_revoke(*args, **kwargs):
+            result = authorize_actor(*args, **kwargs)
+            policy.revoke("admin-1", "*", Permission.AUTHORIZATION_MANAGE)
+            return result
+
+        monkeypatch.setattr(persistence, "authorize_actor", authorize_then_revoke)
+        with pytest.raises(AuthorizationError, match="authorization management permission required"):
+            policy.grant_as(actor, registry, "human-2", "mem-1", Permission.MEMORY_READ)
+        assert not policy.is_allowed("human-2", "mem-1", Permission.MEMORY_READ)
+        assert not any(e["event_type"] == "grant_created" and e["resource_id"] == "mem-1"
+                       for e in policy.audit_events())
+    finally:
+        policy.close()
+        registry.close()
+
+
+def test_v1_schema_migrates_audit_actor_column_without_rewriting_history(tmp_path):
+    db = tmp_path / "legacy-v1.sqlite3"
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute("CREATE TABLE identity_migrations(version INTEGER PRIMARY KEY, applied_at TEXT DEFAULT CURRENT_TIMESTAMP)")
+        conn.execute("INSERT INTO identity_migrations(version) VALUES(1)")
+        conn.execute("""CREATE TABLE identities(identity_id TEXT PRIMARY KEY, display_name TEXT NOT NULL,
+            subject_type TEXT NOT NULL, parent_identity_id TEXT)""")
+        conn.execute("""CREATE TABLE grants(subject_id TEXT NOT NULL, resource_id TEXT NOT NULL,
+            permission TEXT NOT NULL, PRIMARY KEY(subject_id,resource_id,permission))""")
+        conn.execute("""CREATE TABLE identity_audit(event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_type TEXT NOT NULL, subject_id TEXT NOT NULL, resource_id TEXT,
+            permission TEXT, occurred_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
+        conn.execute("INSERT INTO identity_audit(event_type,subject_id) VALUES('identity_registered','old-human')")
+        conn.commit()
+    finally:
+        conn.close()
+
+    registry = SQLiteIdentityRegistry(db)
+    policy = SQLiteAuthorizationPolicy(db)
+    try:
+        assert registry.schema_version == 2
+        columns = {row["name"] for row in registry._db.execute("PRAGMA table_info(identity_audit)")}
+        assert "actor_id" in columns
+        event = next(e for e in policy.audit_events() if e["subject_id"] == "old-human")
+        assert event["actor_id"] is None
+    finally:
+        policy.close()
+        registry.close()

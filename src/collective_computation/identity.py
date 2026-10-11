@@ -31,6 +31,7 @@ class Permission(StrEnum):
     COMPUTE_CONTRIBUTE = "compute:contribute"
     KNOWLEDGE_PUBLISH = "knowledge:publish"
     REWARD_RECEIVE = "reward:receive"
+    AUTHORIZATION_MANAGE = "authorization:manage"
 
 
 @dataclass(frozen=True, slots=True)

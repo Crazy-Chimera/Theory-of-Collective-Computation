@@ -163,6 +163,8 @@ def authorize_actor(
     """
     if not isinstance(actor, AuthenticatedActorContext) or actor._verification_marker is not _CONTEXT_MARKER:
         raise AuthenticationError("verified actor context required")
+    if actor.expires_at <= int(time.time()):
+        raise AuthenticationError("authenticated actor context has expired")
     if registry.get(actor.subject_id) is None:
         raise AuthenticationError("authenticated identity is not registered")
     if not policy.is_allowed(actor.subject_id, resource_id, permission):

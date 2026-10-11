@@ -113,3 +113,24 @@ def test_manually_constructed_actor_context_is_not_accepted(tmp_path):
                 resource_id="mem-1", permission=Permission.MEMORY_READ)
     finally:
         registry.close()
+
+
+def test_actor_context_expiry_is_rechecked_at_authorization_time(tmp_path):
+    expired_clock_auth = HMACTokenAuthenticator(
+        SECRET,
+        expected_issuer="trusted-control-plane",
+        expected_audience="collective-computation",
+        clock=lambda: 150,
+    )
+    token = make_token({"iat": 100, "exp": 200})
+    actor = expired_clock_auth.authenticate("Bearer " + token)
+    registry = SQLiteIdentityRegistry(tmp_path / "expired.sqlite3")
+    try:
+        registry.register(Identity("human-1", "Researcher", SubjectType.HUMAN))
+        policy = AuthorizationPolicy()
+        policy.grant("human-1", "mem-1", Permission.MEMORY_READ)
+        with pytest.raises(AuthenticationError, match="expired"):
+            authorize_actor(actor, registry=registry, policy=policy,
+                resource_id="mem-1", permission=Permission.MEMORY_READ)
+    finally:
+        registry.close()
