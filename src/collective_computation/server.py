@@ -8,7 +8,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
 class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self) -> None:  # noqa: N802 - required by BaseHTTPRequestHandler
+    def _respond(self, include_body: bool) -> None:
         if self.path not in ("/", "/health"):
             self.send_error(404, "not found")
             return
@@ -23,7 +23,15 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        if include_body:
+            self.wfile.write(body)
+
+    def do_GET(self) -> None:  # noqa: N802 - required by BaseHTTPRequestHandler
+        self._respond(include_body=True)
+
+    def do_HEAD(self) -> None:  # noqa: N802 - required by BaseHTTPRequestHandler
+        # Render and other health probes commonly issue HEAD requests.
+        self._respond(include_body=False)
 
     def log_message(self, format: str, *args: object) -> None:
         # Keep request logs concise; Render captures stdout/stderr.
