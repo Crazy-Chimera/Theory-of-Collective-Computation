@@ -95,3 +95,21 @@ def test_authorization_uses_verified_subject_and_defaults_to_deny(tmp_path):
 
 def test_caller_supplied_actor_id_is_not_an_authorization_input():
     assert "actor_id" not in authorize_actor.__code__.co_varnames
+
+
+
+def test_manually_constructed_actor_context_is_not_accepted(tmp_path):
+    registry = SQLiteIdentityRegistry(tmp_path / "ids.sqlite3")
+    try:
+        registry.register(Identity("human-1", "Researcher", SubjectType.HUMAN))
+        policy = AuthorizationPolicy()
+        policy.grant("human-1", "mem-1", Permission.MEMORY_READ)
+        forged = AuthenticatedActorContext(
+            "human-1", "trusted-control-plane", "collective-computation",
+            NOW - 5, NOW + 300, "forged-token-id",
+        )
+        with pytest.raises(AuthenticationError, match="verified actor context"):
+            authorize_actor(forged, registry=registry, policy=policy,
+                resource_id="mem-1", permission=Permission.MEMORY_READ)
+    finally:
+        registry.close()
