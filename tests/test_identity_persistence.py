@@ -12,7 +12,7 @@ def test_identity_and_parent_survive_restart(tmp_path):
     r=SQLiteIdentityRegistry(db)
     try:
         assert r.get("human-1")==h and r.get("agent-1")==a
-        assert len(r)==2 and r.schema_version==1
+        assert len(r)==2 and r.schema_version==2
     finally: r.close()
 
 def test_unknown_parent_and_duplicate_are_rejected(tmp_path):
@@ -73,3 +73,49 @@ def test_registry_and_policy_share_database(tmp_path):
         assert p.is_allowed("human-1","mem-1",Permission.MEMORY_WRITE)
         assert any(e["event_type"]=="identity_registered" for e in p.audit_events())
     finally: p.close()
+
+
+def test_authenticated_grant_and_revoke_record_actor_id(tmp_path):
+    from collective_computation.authentication import HMACTokenAuthenticator
+    from test_authentication import make_token, authenticator
+
+    db = tmp_path / "audit.sqlite3"
+    registry = SQLiteIdentityRegistry(db)
+    policy = SQLiteAuthorizationPolicy(db)
+    try:
+        registry.register(Identity("admin-1", "Admin", SubjectType.HUMAN))
+        registry.register(Identity("human-2", "Member", SubjectType.HUMAN))
+        # Trusted local bootstrap grants the admin-management capability.
+        policy.grant("admin-1", "*", Permission.AUTHORIZATION_MANAGE)
+        actor = authenticator().authenticate("Bearer " + make_token({
+            "sub": "admin-1", "jti": "admin-token",
+        }))
+        policy.grant_as(actor, registry, "human-2", "mem-1", Permission.MEMORY_READ)
+        policy.revoke_as(actor, registry, "human-2", "mem-1", Permission.MEMORY_READ)
+        events = [e for e in policy.audit_events() if e["event_type"] in {"grant_created", "grant_revoked"}]
+        assert [e["event_type"] for e in events] == ["grant_created", "grant_revoked"]
+        assert [e["actor_id"] for e in events] == ["admin-1", "admin-1"]
+    finally:
+        policy.close()
+        registry.close()
+
+
+def test_authenticated_grant_rejects_non_admin_and_forged_context(tmp_path):
+    from collective_computation.authentication import AuthenticationError, AuthenticatedActorContext
+    from test_authentication import make_token, authenticator
+
+    db = tmp_path / "audit.sqlite3"
+    registry = SQLiteIdentityRegistry(db)
+    policy = SQLiteAuthorizationPolicy(db)
+    try:
+        registry.register(Identity("human-1", "Member", SubjectType.HUMAN))
+        actor = authenticator().authenticate("Bearer " + make_token({"sub": "human-1"}))
+        with pytest.raises(AuthenticationError, match="access denied"):
+            policy.grant_as(actor, registry, "human-1", "mem-1", Permission.MEMORY_READ)
+        forged = AuthenticatedActorContext("human-1", "trusted-control-plane",
+            "collective-computation", 1, 4_000_000_000, "forged")
+        with pytest.raises(AuthenticationError, match="verified actor context"):
+            policy.grant_as(forged, registry, "human-1", "mem-1", Permission.MEMORY_READ)
+    finally:
+        policy.close()
+        registry.close()
