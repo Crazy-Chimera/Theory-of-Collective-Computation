@@ -76,8 +76,20 @@ def test_registry_and_policy_share_database(tmp_path):
 
 
 def test_authenticated_grant_and_revoke_record_actor_id(tmp_path):
+    import base64, hashlib, hmac, json, time
     from collective_computation.authentication import HMACTokenAuthenticator
-    from test_authentication import make_token, authenticator
+    secret = b"test-only-secret-material-at-least-32-bytes"
+    now = int(time.time())
+    def make_token(claims):
+        data = {"sub": "admin-1", "iss": "trusted-control-plane", "aud": "collective-computation",
+                "iat": now - 5, "exp": now + 300, "jti": "admin-token"}
+        data.update(claims)
+        payload = base64.urlsafe_b64encode(json.dumps(data, separators=(",", ":")).encode()).rstrip(b"=").decode()
+        signed = f"cc1.{payload}".encode()
+        sig = base64.urlsafe_b64encode(hmac.new(secret, signed, hashlib.sha256).digest()).rstrip(b"=").decode()
+        return f"cc1.{payload}.{sig}"
+    auth = HMACTokenAuthenticator(secret, expected_issuer="trusted-control-plane",
+        expected_audience="collective-computation")
 
     db = tmp_path / "audit.sqlite3"
     registry = SQLiteIdentityRegistry(db)
@@ -87,7 +99,7 @@ def test_authenticated_grant_and_revoke_record_actor_id(tmp_path):
         registry.register(Identity("human-2", "Member", SubjectType.HUMAN))
         # Trusted local bootstrap grants the admin-management capability.
         policy.grant("admin-1", "*", Permission.AUTHORIZATION_MANAGE)
-        actor = authenticator().authenticate("Bearer " + make_token({
+        actor = auth.authenticate("Bearer " + make_token({
             "sub": "admin-1", "jti": "admin-token",
         }))
         policy.grant_as(actor, registry, "human-2", "mem-1", Permission.MEMORY_READ)
@@ -102,14 +114,27 @@ def test_authenticated_grant_and_revoke_record_actor_id(tmp_path):
 
 def test_authenticated_grant_rejects_non_admin_and_forged_context(tmp_path):
     from collective_computation.authentication import AuthenticationError, AuthenticatedActorContext
-    from test_authentication import make_token, authenticator
+    import base64, hashlib, hmac, json, time
+    from collective_computation.authentication import HMACTokenAuthenticator
+    secret = b"test-only-secret-material-at-least-32-bytes"
+    now = int(time.time())
+    def make_token(claims):
+        data = {"sub": "human-1", "iss": "trusted-control-plane", "aud": "collective-computation",
+                "iat": now - 5, "exp": now + 300, "jti": "member-token"}
+        data.update(claims)
+        payload = base64.urlsafe_b64encode(json.dumps(data, separators=(",", ":")).encode()).rstrip(b"=").decode()
+        signed = f"cc1.{payload}".encode()
+        sig = base64.urlsafe_b64encode(hmac.new(secret, signed, hashlib.sha256).digest()).rstrip(b"=").decode()
+        return f"cc1.{payload}.{sig}"
+    auth = HMACTokenAuthenticator(secret, expected_issuer="trusted-control-plane",
+        expected_audience="collective-computation")
 
     db = tmp_path / "audit.sqlite3"
     registry = SQLiteIdentityRegistry(db)
     policy = SQLiteAuthorizationPolicy(db)
     try:
         registry.register(Identity("human-1", "Member", SubjectType.HUMAN))
-        actor = authenticator().authenticate("Bearer " + make_token({"sub": "human-1"}))
+        actor = auth.authenticate("Bearer " + make_token({"sub": "human-1"}))
         with pytest.raises(AuthenticationError, match="access denied"):
             policy.grant_as(actor, registry, "human-1", "mem-1", Permission.MEMORY_READ)
         forged = AuthenticatedActorContext("human-1", "trusted-control-plane",
