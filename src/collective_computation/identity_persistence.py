@@ -4,6 +4,7 @@ import sqlite3
 from pathlib import Path
 from threading import RLock
 from .identity import AuthorizationError, AuthorizationPolicy, Identity, IdentityError, IdentityRegistry, Permission, SubjectType
+from .authentication import AuthenticatedActorContext, authorize_actor
 
 def _connect(path):
     path = str(path)
@@ -37,6 +38,12 @@ def _connect(path):
             db.execute("""CREATE TRIGGER audit_no_delete BEFORE DELETE ON identity_audit BEGIN
                 SELECT RAISE(ABORT,'audit history is append-only'); END""")
             db.execute("INSERT INTO identity_migrations(version) VALUES(1)")
+    if version < 2:
+        columns = {row["name"] for row in db.execute("PRAGMA table_info(identity_audit)")}
+        if "actor_id" not in columns:
+            db.execute("ALTER TABLE identity_audit ADD COLUMN actor_id TEXT")
+        with db:
+            db.execute("INSERT OR IGNORE INTO identity_migrations(version) VALUES(2)")
     return db
 
 class SQLiteIdentityRegistry(IdentityRegistry):
