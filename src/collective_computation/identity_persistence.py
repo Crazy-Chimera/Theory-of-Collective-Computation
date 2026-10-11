@@ -15,7 +15,10 @@ def _connect(path):
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA foreign_keys=ON")
     db.execute("PRAGMA busy_timeout=5000")
+    # Serialize initial schema creation and all upgrades. Re-read the schema version
+    # only after BEGIN IMMEDIATE so concurrent processes cannot race the ALTER TABLE.
     with db:
+        db.execute("BEGIN IMMEDIATE")
         db.execute("CREATE TABLE IF NOT EXISTS identity_migrations(version INTEGER PRIMARY KEY, applied_at TEXT DEFAULT CURRENT_TIMESTAMP)")
         version = db.execute("SELECT MAX(version) v FROM identity_migrations").fetchone()["v"] or 0
         if version > 2:
@@ -39,11 +42,11 @@ def _connect(path):
             db.execute("""CREATE TRIGGER audit_no_delete BEFORE DELETE ON identity_audit BEGIN
                 SELECT RAISE(ABORT,'audit history is append-only'); END""")
             db.execute("INSERT INTO identity_migrations(version) VALUES(1)")
-    if version < 2:
-        columns = {row["name"] for row in db.execute("PRAGMA table_info(identity_audit)")}
-        if "actor_id" not in columns:
-            db.execute("ALTER TABLE identity_audit ADD COLUMN actor_id TEXT")
-        with db:
+            version = 1
+        if version < 2:
+            columns = {row["name"] for row in db.execute("PRAGMA table_info(identity_audit)")}
+            if "actor_id" not in columns:
+                db.execute("ALTER TABLE identity_audit ADD COLUMN actor_id TEXT")
             db.execute("INSERT OR IGNORE INTO identity_migrations(version) VALUES(2)")
     return db
 
