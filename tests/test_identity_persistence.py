@@ -186,3 +186,34 @@ def test_authenticated_grant_rechecks_admin_capability_inside_transaction(tmp_pa
     finally:
         policy.close()
         registry.close()
+
+
+def test_v1_schema_migrates_audit_actor_column_without_rewriting_history(tmp_path):
+    db = tmp_path / "legacy-v1.sqlite3"
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute("CREATE TABLE identity_migrations(version INTEGER PRIMARY KEY, applied_at TEXT DEFAULT CURRENT_TIMESTAMP)")
+        conn.execute("INSERT INTO identity_migrations(version) VALUES(1)")
+        conn.execute("""CREATE TABLE identities(identity_id TEXT PRIMARY KEY, display_name TEXT NOT NULL,
+            subject_type TEXT NOT NULL, parent_identity_id TEXT)""")
+        conn.execute("""CREATE TABLE grants(subject_id TEXT NOT NULL, resource_id TEXT NOT NULL,
+            permission TEXT NOT NULL, PRIMARY KEY(subject_id,resource_id,permission))""")
+        conn.execute("""CREATE TABLE identity_audit(event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_type TEXT NOT NULL, subject_id TEXT NOT NULL, resource_id TEXT,
+            permission TEXT, occurred_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
+        conn.execute("INSERT INTO identity_audit(event_type,subject_id) VALUES('identity_registered','old-human')")
+        conn.commit()
+    finally:
+        conn.close()
+
+    registry = SQLiteIdentityRegistry(db)
+    policy = SQLiteAuthorizationPolicy(db)
+    try:
+        assert registry.schema_version == 2
+        columns = {row["name"] for row in registry._db.execute("PRAGMA table_info(identity_audit)")}
+        assert "actor_id" in columns
+        event = next(e for e in policy.audit_events() if e["subject_id"] == "old-human")
+        assert event["actor_id"] is None
+    finally:
+        policy.close()
+        registry.close()
