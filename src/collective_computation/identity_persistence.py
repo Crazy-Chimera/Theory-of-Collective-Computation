@@ -17,7 +17,7 @@ def _connect(path):
     with db:
         db.execute("CREATE TABLE IF NOT EXISTS identity_migrations(version INTEGER PRIMARY KEY, applied_at TEXT DEFAULT CURRENT_TIMESTAMP)")
         version = db.execute("SELECT MAX(version) v FROM identity_migrations").fetchone()["v"] or 0
-        if version > 1:
+        if version > 2:
             raise RuntimeError("database schema newer than this implementation")
         if version == 0:
             db.execute("""CREATE TABLE identities(identity_id TEXT PRIMARY KEY, display_name TEXT NOT NULL,
@@ -129,6 +129,50 @@ class SQLiteAuthorizationPolicy(AuthorizationPolicy):
         with self._lock:
             return self._db.execute("SELECT 1 FROM grants WHERE subject_id=? AND resource_id=? AND permission=?",
                 (subject_id, resource_id, permission.value)).fetchone() is not None
+
+    def grant_as(
+        self, actor: AuthenticatedActorContext, registry: SQLiteIdentityRegistry,
+        subject_id: str, resource_id: str, permission: Permission,
+    ) -> None:
+        """Grant access and attribute the audit event to an authenticated administrator.
+
+        The actor must have authorization:manage on the reserved '*' resource.
+        Legacy grant() remains a trusted local/bootstrap operation and records no actor.
+        """
+        authorize_actor(actor, registry=registry, policy=self,
+            resource_id="*", permission=Permission.AUTHORIZATION_MANAGE)
+        if not isinstance(subject_id, str) or not subject_id.strip() or not isinstance(resource_id, str) or not resource_id.strip():
+            raise AuthorizationError("subject_id and resource_id must not be empty")
+        if not isinstance(permission, Permission):
+            raise AuthorizationError("permission must be a Permission")
+        with self._lock, self._db:
+            cur = self._db.execute("INSERT OR IGNORE INTO grants VALUES(?,?,?)",
+                (subject_id, resource_id, permission.value))
+            if cur.rowcount:
+                self._db.execute(
+                    "INSERT INTO identity_audit(event_type,subject_id,resource_id,permission,actor_id) VALUES('grant_created',?,?,?,?)",
+                    (subject_id, resource_id, permission.value, actor.subject_id),
+                )
+
+    def revoke_as(
+        self, actor: AuthenticatedActorContext, registry: SQLiteIdentityRegistry,
+        subject_id: str, resource_id: str, permission: Permission,
+    ) -> None:
+        """Revoke access and attribute the audit event to an authenticated administrator."""
+        authorize_actor(actor, registry=registry, policy=self,
+            resource_id="*", permission=Permission.AUTHORIZATION_MANAGE)
+        if not isinstance(subject_id, str) or not subject_id.strip() or not isinstance(resource_id, str) or not resource_id.strip():
+            raise AuthorizationError("subject_id and resource_id must not be empty")
+        if not isinstance(permission, Permission):
+            raise AuthorizationError("permission must be a Permission")
+        with self._lock, self._db:
+            cur = self._db.execute("DELETE FROM grants WHERE subject_id=? AND resource_id=? AND permission=?",
+                (subject_id, resource_id, permission.value))
+            if cur.rowcount:
+                self._db.execute(
+                    "INSERT INTO identity_audit(event_type,subject_id,resource_id,permission,actor_id) VALUES('grant_revoked',?,?,?,?)",
+                    (subject_id, resource_id, permission.value, actor.subject_id),
+                )
 
     def audit_events(self):
         with self._lock:
