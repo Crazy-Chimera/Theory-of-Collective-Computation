@@ -11,10 +11,12 @@ import hashlib
 import hmac
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Protocol
 
 from .identity import Permission
+
+_CONTEXT_MARKER = object()
 
 
 class AuthenticationError(ValueError):
@@ -38,6 +40,7 @@ class AuthenticatedActorContext:
     issued_at: int
     expires_at: int
     token_id: str
+    _verification_marker: object = field(default=None, repr=False, compare=False)
 
 
 def _b64url_decode(value: str) -> bytes:
@@ -107,7 +110,10 @@ class HMACTokenAuthenticator:
         if len(parts) != 3 or parts[0] != self._PREFIX:
             raise AuthenticationError("malformed bearer token")
 
-        signed = f"{parts[0]}.{parts[1]}".encode("ascii")
+        try:
+            signed = f"{parts[0]}.{parts[1]}".encode("ascii")
+        except UnicodeEncodeError as exc:
+            raise AuthenticationError("malformed bearer token") from exc
         supplied_signature = _b64url_decode(parts[2])
         expected_signature = hmac.new(self._secret, signed, hashlib.sha256).digest()
         if not hmac.compare_digest(supplied_signature, expected_signature):
@@ -139,6 +145,7 @@ class HMACTokenAuthenticator:
         return AuthenticatedActorContext(
             subject_id=claims["sub"], issuer=claims["iss"], audience=claims["aud"],
             issued_at=issued_at, expires_at=expires_at, token_id=claims["jti"],
+            _verification_marker=_CONTEXT_MARKER,
         )
 
 
@@ -154,7 +161,7 @@ def authorize_actor(
 
     The subject comes from the verified context; no actor_id argument exists.
     """
-    if not isinstance(actor, AuthenticatedActorContext):
+    if not isinstance(actor, AuthenticatedActorContext) or actor._verification_marker is not _CONTEXT_MARKER:
         raise AuthenticationError("verified actor context required")
     if registry.get(actor.subject_id) is None:
         raise AuthenticationError("authenticated identity is not registered")
